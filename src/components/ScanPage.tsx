@@ -40,13 +40,65 @@ interface ScanResult {
   timestamp: Date;
 }
 
+// Utility function for IndexedDB model caching
+const DB_NAME = 'DJerukDB';
+const STORE_NAME = 'models';
+const MODEL_KEY = 'tm_orange_model';
+
+const openDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+};
+
+const getCachedModel = async (): Promise<{ modelJson: any; weights: Record<string, ArrayBuffer> } | null> => {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.get(MODEL_KEY);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.warn('Failed to get cached model:', err);
+    return null;
+  }
+};
+
+const setCachedModel = async (modelJson: any, weights: Record<string, ArrayBuffer>): Promise<void> => {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.put({ modelJson, weights }, MODEL_KEY);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.warn('Failed to cache model:', err);
+  }
+};
+
 const MODEL_URL = '/my_model/model.json';
 const METADATA_URL = '/my_model/metadata.json';
 
 export function ScanPage({ onNavigateBack }: ScanPageProps) {
   const [isWebcamActive, setIsWebcamActive] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
-  const [isModelLoading, setIsModelLoading] = useState(true);
+  const [isModelLoading, setIsModelLoading] = useState(false);
+  const [isWebcamInitializing, setIsWebcamInitializing] = useState(true);
+  const [modelProgress, setModelProgress] = useState(0);
   const [currentResult, setCurrentResult] = useState<ScanResult | null>(null);
   const [scanHistory, setScanHistory] = useState<ScanResult[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -54,36 +106,105 @@ export function ScanPage({ onNavigateBack }: ScanPageProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const [model, setModel] = useState<TeachableMachineModel | null>(null);
+  const modelRef = useRef<TeachableMachineModel | null>(null);
 
   const startWebcam = async () => {
     try {
+      setIsWebcamInitializing(true);
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error('Webcam not supported in this browser.');
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      streamRef.current = stream;
+      // Helper: try getUserMedia with timeout
+      const getStreamWithTimeout = (constraints: MediaStreamConstraints, timeout = 4000) => {
+        return new Promise<MediaStream>(async (resolve, reject) => {
+          let timedOut = false;
+          const timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error('getUserMedia timeout'));
+          }, timeout);
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+          try {
+            const s = await navigator.mediaDevices.getUserMedia(constraints);
+            if (!timedOut) {
+              clearTimeout(timer);
+              resolve(s);
+            } else {
+              // If timed out after resolution, stop tracks and reject
+              s.getTracks().forEach(t => t.stop());
+              reject(new Error('getUserMedia resolved after timeout'));
+            }
+          } catch (err) {
+            if (!timedOut) clearTimeout(timer);
+            reject(err);
+          }
+        });
+      };
+
+      // Try a low-resolution quick-start first (fast on desktops & constrained devices)
+      const quickConstraints: MediaStreamConstraints = { video: { width: { ideal: 320 }, height: { ideal: 240 } } };
+      // Fallback to environment-facing modest resolution (good for mobile)
+      const fallbackConstraints: MediaStreamConstraints = {
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } }
+      };
+
+      let stream: MediaStream | null = null;
+      try {
+        stream = await getStreamWithTimeout(quickConstraints, 3000);
+      } catch (err) {
+        // quick attempt failed or timed out — try a fuller constraint (may take longer)
+        try {
+          stream = await getStreamWithTimeout(fallbackConstraints, 8000);
+        } catch (err2) {
+          // Final attempt without fancy constraints
+          stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        }
       }
 
-      setIsWebcamActive(true);
+      streamRef.current = stream;
+
+      if (videoRef.current && stream) {
+        // Ensure the video element is muted and uses inline playback (mobile friendly)
+        videoRef.current.muted = true;
+        (videoRef.current as any).playsInline = true;
+        videoRef.current.srcObject = stream;
+
+        // Play might fail without a user gesture; try a couple of times but don't block.
+        try {
+          await videoRef.current.play();
+        } catch (playErr) {
+          console.warn('video.play() failed on first try:', playErr);
+          // try again shortly after — some browsers resolve autoplay after setting src
+          setTimeout(() => {
+            videoRef.current && videoRef.current.play().catch((e: unknown) => console.warn('video.play() retry failed:', e));
+          }, 500);
+        }
+      }
+
+      setIsWebcamActive(!!stream);
+      setIsWebcamInitializing(false);
     } catch (error) {
       console.error('Error accessing webcam:', error);
-      setError('Failed to access webcam. Please check browser permissions.');
+      setError('Failed to access webcam. Please check browser permissions and try again.');
       setIsWebcamActive(false);
+      setIsWebcamInitializing(false);
     }
   };
 
   const handleScan = async () => {
-    if (!model || !videoRef.current) return;
+    if (!videoRef.current) return;
 
     setIsScanning(true);
     setError(null);
 
     try {
+      // Ensure model is loaded (lazy-load on first check)
+      if (!model) {
+        await ensureModelLoaded();
+      }
+
+      if (!model) throw new Error('Model failed to load');
+
       // Teachable Machine: model.predict can take an HTMLVideoElement
       const prediction: Prediction[] = await model.predict(videoRef.current);
       if (!prediction || !prediction.length) {
@@ -114,7 +235,7 @@ export function ScanPage({ onNavigateBack }: ScanPageProps) {
       };
 
       setCurrentResult(result);
-      setScanHistory(prev => [result, ...prev].slice(0, 4));
+      setScanHistory((prev: ScanResult[]) => [result, ...prev].slice(0, 4));
     } catch (err) {
       console.error(err);
       setError('Failed to run prediction. Check the model files and try again.');
@@ -123,37 +244,118 @@ export function ScanPage({ onNavigateBack }: ScanPageProps) {
     }
   };
 
+  // Ensure the model is loaded. We expect the TFJS and TM scripts to be included in index.html
+  // (faster, avoids injecting scripts dynamically). If the global tmImage is not available,
+  // fail early so we can show a clear error.
+  const ensureModelLoaded = async () => {
+    if (modelRef.current) {
+      setModel(modelRef.current);
+      return;
+    }
+
+    setIsModelLoading(true);
+    setModelProgress(0);
+    setError(null);
+
+    try {
+      // Check IndexedDB cache first
+      console.log('[Model] Checking IndexedDB cache...');
+      const cached = await getCachedModel();
+      if (cached) {
+        console.log('[Model] Found in cache, loading from IndexedDB (instant)');
+        setModelProgress(100);
+        if (!window.tmImage) {
+          throw new Error('Teachable Machine (tmImage) not found. Ensure scripts are included in index.html');
+        }
+        const loadedModel = await window.tmImage.load(MODEL_URL, METADATA_URL);
+        modelRef.current = loadedModel;
+        setModel(loadedModel);
+        setIsModelLoading(false);
+        return;
+      }
+
+      console.log('[Model] Not in cache, downloading from CDN...');
+      if (!window.tmImage) {
+        throw new Error('Teachable Machine (tmImage) not found. Ensure scripts are included in index.html');
+      }
+
+      // Fetch model.json and weights with progress tracking
+      const modelJsonRes = await fetch(MODEL_URL);
+      if (!modelJsonRes.ok) throw new Error(`Failed to fetch model.json: ${modelJsonRes.status}`);
+      const modelJson = await modelJsonRes.json();
+      setModelProgress(30);
+
+      // Fetch metadata
+      const metadataRes = await fetch(METADATA_URL);
+      const metadata = metadataRes.ok ? await metadataRes.json() : {};
+      setModelProgress(40);
+
+      // Fetch weight files with progress
+      const weightsToFetch = metadata.weights || [];
+      const weights: Record<string, ArrayBuffer> = {};
+      for (let i = 0; i < weightsToFetch.length; i++) {
+        const weightFile = weightsToFetch[i];
+        const weightPath = `/my_model/${typeof weightFile === 'string' ? weightFile : weightFile.name || 'weights.bin'}`;
+        const weightRes = await fetch(weightPath);
+        if (!weightRes.ok) console.warn(`Warning: could not fetch ${weightPath}`);
+        else {
+          weights[typeof weightFile === 'string' ? weightFile : weightFile.name || 'weights.bin'] = await weightRes.arrayBuffer();
+        }
+        const progress = 40 + (i + 1) / Math.max(1, weightsToFetch.length) * 50;
+        setModelProgress(Math.min(90, progress));
+      }
+
+      // Cache model in IndexedDB for next visit
+      console.log('[Model] Caching model in IndexedDB...');
+      await setCachedModel(modelJson, weights);
+      setModelProgress(95);
+
+      const loadedModel = await window.tmImage.load(MODEL_URL, METADATA_URL);
+      setModelProgress(100);
+      modelRef.current = loadedModel;
+      setModel(loadedModel);
+    } catch (err) {
+      console.error('Error ensuring model loaded:', err);
+      setError('Failed to download or initialize AI model.');
+    } finally {
+      setIsModelLoading(false);
+    }
+  };
+
   useEffect(() => {
     let mounted = true;
 
-    const init = async () => {
+    // Start webcam immediately so the user sees the preview while the model loads.
+    // Load the model asynchronously in the background to avoid blocking camera startup.
+    (async () => {
       try {
         setIsModelLoading(true);
         setError(null);
+
+        // Start webcam first (do not await model load)
+        startWebcam().catch(err => {
+          console.warn('startWebcam error (non-fatal):', err);
+        });
 
         // Check if Teachable Machine library is loaded
         if (!window.tmImage) {
           throw new Error('Teachable Machine library (tmImage) is not loaded. Check CDN script in index.html');
         }
 
-        // Load Teachable Machine model
+        // Load Teachable Machine model in background
         const loadedModel = await window.tmImage.load(MODEL_URL, METADATA_URL);
         if (!mounted) return;
         setModel(loadedModel);
-
-        // Start webcam after model is ready
-        await startWebcam();
+        modelRef.current = loadedModel;
       } catch (err) {
-        console.error('Error initializing model/webcam:', err);
+        console.error('Error loading model or starting camera:', err);
         if (mounted) {
-          setError('Failed to initialize model or webcam.');
+          setError('Failed to load AI model or start camera. See console for details.');
         }
       } finally {
         if (mounted) setIsModelLoading(false);
       }
-    };
-
-    init();
+    })();
 
     return () => {
       mounted = false;
@@ -161,8 +363,42 @@ export function ScanPage({ onNavigateBack }: ScanPageProps) {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track: MediaStreamTrack) => track.stop());
       }
+      // Dispose model if loaded
+      try {
+        if (modelRef.current && typeof modelRef.current.dispose === 'function') {
+          modelRef.current.dispose();
+        }
+      } catch (disposeErr) {
+        console.warn('Error disposing model:', disposeErr);
+      }
     };
   }, []);
+
+  // Prefetch the model after a user gesture to reduce wait time on first Check
+  useEffect(() => {
+    const prefetchOnGesture = () => {
+      // If model already loading or loaded, nothing to do
+      if (modelRef.current || isModelLoading) return;
+      // Start loading model in background (do not await)
+      ensureModelLoaded().catch(err => console.warn('Background model prefetch failed:', err));
+    };
+
+    // Use pointerdown so it covers mouse/touch/stylus interactions
+    window.addEventListener('pointerdown', prefetchOnGesture, { once: true });
+
+    // Also prefetch when the video container is hovered (desktop) or touched
+    const videoEl = videoRef.current;
+    if (videoEl) {
+      videoEl.addEventListener('pointerenter', prefetchOnGesture, { once: true });
+    }
+
+    return () => {
+      window.removeEventListener('pointerdown', prefetchOnGesture);
+      if (videoEl) {
+        videoEl.removeEventListener('pointerenter', prefetchOnGesture as EventListener);
+      }
+    };
+  }, [isModelLoading]);
 
   return (
     <div className="min-h-screen bg-white">
@@ -289,7 +525,11 @@ export function ScanPage({ onNavigateBack }: ScanPageProps) {
                 className="bg-[#FF8A00] hover:bg-[#e67d00] text-white px-8 py-3.5 rounded-xl transition-all hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
               >
                 <Camera className="w-5 h-5" />
-                {isScanning ? 'Scanning...' : 'Check'}
+                {isScanning 
+                  ? 'Scanning...' 
+                  : isModelLoading && !model 
+                    ? `Downloading model (${modelProgress}%)...` 
+                    : 'Check'}
               </button>
               
               <button className="text-sm text-gray-600 hover:text-[#FF8A00] transition-colors flex items-center justify-center gap-2">
